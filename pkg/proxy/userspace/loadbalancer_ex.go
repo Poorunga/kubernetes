@@ -1,28 +1,16 @@
-/*
-Copyright 2014 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package userspace
 
 import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	istioapi "istio.io/client-go/pkg/apis/networking/v1alpha3"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -52,19 +40,53 @@ type affinityPolicy struct {
 	ttlSeconds   int
 }
 
-// LoadBalancerRR is a round-robin load balancer.
-type LoadBalancerRR struct {
-	lock     sync.RWMutex
-	services map[proxy.ServicePortName]*balancerState
+// LoadBalancerEX is a extended load balancer.
+type LoadBalancerEX struct {
+	lock        sync.RWMutex
+	services    map[proxy.ServicePortName]*balancerState
+	strategyMap map[types.NamespacedName]LoadBalancerStrategy
 }
 
 // Ensure this implements LoadBalancer.
-var _ LoadBalancer = &LoadBalancerRR{}
+var _ LoadBalancer = &LoadBalancerEX{}
 
 type balancerState struct {
-	endpoints []string // a list of "ip:port" style strings
+	endpoints []string // a list of "nodeName:podName:ip:port" style strings, nodeName and podName can be empty!!!
 	index     int      // current index into endpoints
 	affinity  affinityPolicy
+}
+
+// isValidEndpoint checks that the given host / port pair are valid endpoint
+func isValidEndpoint(host string, port int) bool {
+	return host != "" && port > 0
+}
+
+// buildPortsToEndpointsMap builds a map of portname -> all nodeName:podName:ip:port
+// for that portname. Explode Endpoints.Subsets[*] into this structure.
+func buildPortsToEndpointsMap(endpoints *v1.Endpoints) map[string][]string {
+	portsToEndpoints := map[string][]string{}
+	for i := range endpoints.Subsets {
+		ss := &endpoints.Subsets[i]
+		for i := range ss.Ports {
+			port := &ss.Ports[i]
+			for i := range ss.Addresses {
+				addr := &ss.Addresses[i]
+				if isValidEndpoint(addr.IP, int(port.Port)) {
+					nodeName := EmptyNodeName
+					podName := EmptyPodName
+					if addr.NodeName != nil {
+						nodeName = *addr.NodeName
+					}
+					if addr.TargetRef != nil {
+						podName = addr.TargetRef.Name
+					}
+					endpoint := fmt.Sprintf("%s:%s:%s", nodeName, podName, net.JoinHostPort(addr.IP, strconv.Itoa(int(port.Port))))
+					portsToEndpoints[port.Name] = append(portsToEndpoints[port.Name], endpoint)
+				}
+			}
+		}
+	}
+	return portsToEndpoints
 }
 
 func newAffinityPolicy(affinityType v1.ServiceAffinity, ttlSeconds int) *affinityPolicy {
@@ -75,15 +97,16 @@ func newAffinityPolicy(affinityType v1.ServiceAffinity, ttlSeconds int) *affinit
 	}
 }
 
-// NewLoadBalancerRR returns a new LoadBalancerRR.
-func NewLoadBalancerRR() *LoadBalancerRR {
-	return &LoadBalancerRR{
-		services: map[proxy.ServicePortName]*balancerState{},
+// NewLoadBalancerEX returns a new LoadBalancerEX.
+func NewLoadBalancerEX() *LoadBalancerEX {
+	return &LoadBalancerEX{
+		services:    map[proxy.ServicePortName]*balancerState{},
+		strategyMap: map[types.NamespacedName]LoadBalancerStrategy{},
 	}
 }
 
-func (lb *LoadBalancerRR) NewService(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) error {
-	klog.V(4).InfoS("LoadBalancerRR NewService", "servicePortName", svcPort)
+func (lb *LoadBalancerEX) NewService(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) error {
+	klog.V(4).InfoS("LoadBalancerEX NewService", "servicePortName", svcPort)
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 	lb.newServiceInternal(svcPort, affinityType, ttlSeconds)
@@ -91,22 +114,22 @@ func (lb *LoadBalancerRR) NewService(svcPort proxy.ServicePortName, affinityType
 }
 
 // This assumes that lb.lock is already held.
-func (lb *LoadBalancerRR) newServiceInternal(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) *balancerState {
+func (lb *LoadBalancerEX) newServiceInternal(svcPort proxy.ServicePortName, affinityType v1.ServiceAffinity, ttlSeconds int) *balancerState {
 	if ttlSeconds == 0 {
 		ttlSeconds = int(v1.DefaultClientIPServiceAffinitySeconds) //default to 3 hours if not specified.  Should 0 be unlimited instead????
 	}
 
 	if _, exists := lb.services[svcPort]; !exists {
 		lb.services[svcPort] = &balancerState{affinity: *newAffinityPolicy(affinityType, ttlSeconds)}
-		klog.V(4).InfoS("LoadBalancerRR service does not exist, created", "servicePortName", svcPort)
+		klog.V(4).InfoS("LoadBalancerEX service does not exist, created", "servicePortName", svcPort)
 	} else if affinityType != "" {
 		lb.services[svcPort].affinity.affinityType = affinityType
 	}
 	return lb.services[svcPort]
 }
 
-func (lb *LoadBalancerRR) DeleteService(svcPort proxy.ServicePortName) {
-	klog.V(4).InfoS("LoadBalancerRR DeleteService", "servicePortName", svcPort)
+func (lb *LoadBalancerEX) DeleteService(svcPort proxy.ServicePortName) {
+	klog.V(4).InfoS("LoadBalancerEX DeleteService", "servicePortName", svcPort)
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 	delete(lb.services, svcPort)
@@ -122,7 +145,7 @@ func isSessionAffinity(affinity *affinityPolicy) bool {
 }
 
 // ServiceHasEndpoints checks whether a service entry has endpoints.
-func (lb *LoadBalancerRR) ServiceHasEndpoints(svcPort proxy.ServicePortName) bool {
+func (lb *LoadBalancerEX) ServiceHasEndpoints(svcPort proxy.ServicePortName) bool {
 	lb.lock.RLock()
 	defer lb.lock.RUnlock()
 	state, exists := lb.services[svcPort]
@@ -131,9 +154,25 @@ func (lb *LoadBalancerRR) ServiceHasEndpoints(svcPort proxy.ServicePortName) boo
 	return exists && state != nil && len(state.endpoints) > 0
 }
 
+// TryPickEndpoint try to pick a service endpoint from load-balance strategy.
+func (lb *LoadBalancerEX) TryPickEndpoint(svcName types.NamespacedName, sessionAffinityEnabled bool, endpoints []string, tcpConn *net.TCPConn) (string, *http.Request, bool) {
+	strategy, exists := lb.strategyMap[svcName]
+	if !exists {
+		return "", nil, false
+	}
+	if exists && sessionAffinityEnabled {
+		klog.Warningf("LoadBalancer strategy conflicted with sessionAffinity: ClientIP")
+		return "", nil, false
+	}
+	endpoint, req, err := strategy.Pick(endpoints, tcpConn)
+	if err != nil {
+		return "", req, false
+	}
+	return endpoint, req, true
+}
+
 // NextEndpoint returns a service endpoint.
-// The service endpoint is chosen using the round-robin algorithm.
-func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr net.Addr, sessionAffinityReset bool) (string, error) {
+func (lb *LoadBalancerEX) NextEndpoint(svcPort proxy.ServicePortName, srcAddr net.Addr, tcpConn *net.TCPConn, sessionAffinityReset bool) (string, *http.Request, error) {
 	// Coarse locking is simple.  We can get more fine-grained if/when we
 	// can prove it matters.
 	lb.lock.Lock()
@@ -141,14 +180,21 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 
 	state, exists := lb.services[svcPort]
 	if !exists || state == nil {
-		return "", ErrMissingServiceEntry
+		return "", nil, ErrMissingServiceEntry
 	}
 	if len(state.endpoints) == 0 {
-		return "", ErrMissingEndpoints
+		return "", nil, ErrMissingEndpoints
 	}
 	klog.V(4).InfoS("NextEndpoint for service", "servicePortName", svcPort, "address", srcAddr, "endpoints", state.endpoints)
 
 	sessionAffinityEnabled := isSessionAffinity(&state.affinity)
+
+	// Note: because load-balance strategy may have read http.Request from inConn,
+	// so here we need to return it to outConn!
+	endpoint, req, picked := lb.TryPickEndpoint(svcPort.NamespacedName, sessionAffinityEnabled, state.endpoints, tcpConn)
+	if picked {
+		return endpoint, req, nil
+	}
 
 	var ipaddr string
 	if sessionAffinityEnabled {
@@ -156,7 +202,7 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 		var err error
 		ipaddr, _, err = net.SplitHostPort(srcAddr.String())
 		if err != nil {
-			return "", fmt.Errorf("malformed source address %q: %v", srcAddr.String(), err)
+			return "", req, fmt.Errorf("malformed source address %q: %v", srcAddr.String(), err)
 		}
 		if !sessionAffinityReset {
 			sessionAffinity, exists := state.affinity.affinityMap[ipaddr]
@@ -165,12 +211,12 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 				endpoint := sessionAffinity.endpoint
 				sessionAffinity.lastUsed = time.Now()
 				klog.V(4).InfoS("NextEndpoint for service from IP with sessionAffinity", "servicePortName", svcPort, "IP", ipaddr, "sessionAffinity", sessionAffinity, "endpoint", endpoint)
-				return endpoint, nil
+				return endpoint, req, nil
 			}
 		}
 	}
 	// Take the next endpoint.
-	endpoint := state.endpoints[state.index]
+	endpoint = state.endpoints[state.index]
 	state.index = (state.index + 1) % len(state.endpoints)
 
 	if sessionAffinityEnabled {
@@ -186,7 +232,7 @@ func (lb *LoadBalancerRR) NextEndpoint(svcPort proxy.ServicePortName, srcAddr ne
 		klog.V(4).InfoS("Updated affinity key", "IP", ipaddr, "affinityState", state.affinity.affinityMap[ipaddr])
 	}
 
-	return endpoint, nil
+	return endpoint, req, nil
 }
 
 // Remove any session affinity records associated to a particular endpoint (for example when a pod goes down).
@@ -202,7 +248,7 @@ func removeSessionAffinityByEndpoint(state *balancerState, svcPort proxy.Service
 // Loop through the valid endpoints and then the endpoints associated with the Load Balancer.
 // Then remove any session affinity records that are not in both lists.
 // This assumes the lb.lock is held.
-func (lb *LoadBalancerRR) removeStaleAffinity(svcPort proxy.ServicePortName, newEndpoints []string) {
+func (lb *LoadBalancerEX) removeStaleAffinity(svcPort proxy.ServicePortName, newEndpoints []string) {
 	newEndpointsSet := sets.NewString()
 	for _, newEndpoint := range newEndpoints {
 		newEndpointsSet.Insert(newEndpoint)
@@ -220,8 +266,8 @@ func (lb *LoadBalancerRR) removeStaleAffinity(svcPort proxy.ServicePortName, new
 	}
 }
 
-func (lb *LoadBalancerRR) OnEndpointsAdd(endpoints *v1.Endpoints) {
-	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
+func (lb *LoadBalancerEX) OnEndpointsAdd(endpoints *v1.Endpoints) {
+	portsToEndpoints := buildPortsToEndpointsMap(endpoints)
 
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
@@ -232,7 +278,7 @@ func (lb *LoadBalancerRR) OnEndpointsAdd(endpoints *v1.Endpoints) {
 		state, exists := lb.services[svcPort]
 
 		if !exists || state == nil || len(newEndpoints) > 0 {
-			klog.V(1).InfoS("LoadBalancerRR: Setting endpoints service", "servicePortName", svcPort, "endpoints", newEndpoints)
+			klog.V(1).InfoS("LoadBalancerEX: Setting endpoints service", "servicePortName", svcPort, "endpoints", newEndpoints)
 			// OnEndpointsAdd can be called without NewService being called externally.
 			// To be safe we will call it here.  A new service will only be created
 			// if one does not already exist.
@@ -243,11 +289,17 @@ func (lb *LoadBalancerRR) OnEndpointsAdd(endpoints *v1.Endpoints) {
 			state.index = 0
 		}
 	}
+
+	// Sync the load-balance strategy.
+	svcName := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
+	if _, exists := lb.strategyMap[svcName]; exists {
+		lb.strategyMap[svcName].Sync(lb.getServiceEndpoints(svcName))
+	}
 }
 
-func (lb *LoadBalancerRR) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {
-	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
-	oldPortsToEndpoints := util.BuildPortsToEndpointsMap(oldEndpoints)
+func (lb *LoadBalancerEX) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoints) {
+	portsToEndpoints := buildPortsToEndpointsMap(endpoints)
+	oldPortsToEndpoints := buildPortsToEndpointsMap(oldEndpoints)
 	registeredEndpoints := make(map[proxy.ServicePortName]bool)
 
 	lb.lock.Lock()
@@ -264,7 +316,7 @@ func (lb *LoadBalancerRR) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoint
 		}
 
 		if !exists || state == nil || len(curEndpoints) != len(newEndpoints) || !slicesEquiv(stringslices.Clone(curEndpoints), newEndpoints) {
-			klog.V(1).InfoS("LoadBalancerRR: Setting endpoints for service", "servicePortName", svcPort, "endpoints", newEndpoints)
+			klog.V(1).InfoS("LoadBalancerEX: Setting endpoints for service", "servicePortName", svcPort, "endpoints", newEndpoints)
 			lb.removeStaleAffinity(svcPort, newEndpoints)
 			// OnEndpointsUpdate can be called without NewService being called externally.
 			// To be safe we will call it here.  A new service will only be created
@@ -286,13 +338,19 @@ func (lb *LoadBalancerRR) OnEndpointsUpdate(oldEndpoints, endpoints *v1.Endpoint
 			lb.resetService(svcPort)
 		}
 	}
+
+	// Sync the load-balance strategy.
+	svcName := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
+	if _, exists := lb.strategyMap[svcName]; exists {
+		lb.strategyMap[svcName].Sync(lb.getServiceEndpoints(svcName))
+	}
 }
 
-func (lb *LoadBalancerRR) resetService(svcPort proxy.ServicePortName) {
+func (lb *LoadBalancerEX) resetService(svcPort proxy.ServicePortName) {
 	// If the service is still around, reset but don't delete.
 	if state, ok := lb.services[svcPort]; ok {
 		if len(state.endpoints) > 0 {
-			klog.V(2).InfoS("LoadBalancerRR: Removing endpoints service", "servicePortName", svcPort)
+			klog.V(2).InfoS("LoadBalancerEX: Removing endpoints service", "servicePortName", svcPort)
 			state.endpoints = []string{}
 		}
 		state.index = 0
@@ -300,8 +358,8 @@ func (lb *LoadBalancerRR) resetService(svcPort proxy.ServicePortName) {
 	}
 }
 
-func (lb *LoadBalancerRR) OnEndpointsDelete(endpoints *v1.Endpoints) {
-	portsToEndpoints := util.BuildPortsToEndpointsMap(endpoints)
+func (lb *LoadBalancerEX) OnEndpointsDelete(endpoints *v1.Endpoints) {
+	portsToEndpoints := buildPortsToEndpointsMap(endpoints)
 
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
@@ -310,9 +368,15 @@ func (lb *LoadBalancerRR) OnEndpointsDelete(endpoints *v1.Endpoints) {
 		svcPort := proxy.ServicePortName{NamespacedName: types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}, Port: portname}
 		lb.resetService(svcPort)
 	}
+
+	// If the endpoints is still around, sync but don't delete.
+	svcName := types.NamespacedName{Namespace: endpoints.Namespace, Name: endpoints.Name}
+	if _, exists := lb.strategyMap[svcName]; exists {
+		lb.strategyMap[svcName].Sync(lb.getServiceEndpoints(svcName))
+	}
 }
 
-func (lb *LoadBalancerRR) OnEndpointsSynced() {
+func (lb *LoadBalancerEX) OnEndpointsSynced() {
 }
 
 // Tests whether two slices are equivalent.  This sorts both slices in-place.
@@ -325,7 +389,7 @@ func slicesEquiv(lhs, rhs []string) bool {
 	return stringslices.Equal(lhs, rhs)
 }
 
-func (lb *LoadBalancerRR) CleanupStaleStickySessions(svcPort proxy.ServicePortName) {
+func (lb *LoadBalancerEX) CleanupStaleStickySessions(svcPort proxy.ServicePortName) {
 	lb.lock.Lock()
 	defer lb.lock.Unlock()
 
@@ -339,4 +403,73 @@ func (lb *LoadBalancerRR) CleanupStaleStickySessions(svcPort proxy.ServicePortNa
 			delete(state.affinity.affinityMap, ip)
 		}
 	}
+}
+
+func (lb *LoadBalancerEX) OnDestinationRuleAdd(dr *istioapi.DestinationRule) {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	svcName := types.NamespacedName{Namespace: dr.Namespace, Name: dr.Name}
+	if _, exists := lb.strategyMap[svcName]; !exists {
+		lb.setLoadBalancerStrategy(dr, getStrategyName(dr))
+	}
+}
+
+func (lb *LoadBalancerEX) OnDestinationRuleUpdate(oldDr, dr *istioapi.DestinationRule) {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	newStrategy := getStrategyName(dr)
+	svcName := types.NamespacedName{Namespace: dr.Namespace, Name: dr.Name}
+	if _, exists := lb.strategyMap[svcName]; !exists {
+		lb.setLoadBalancerStrategy(dr, newStrategy)
+	} else {
+		if newStrategy != "" && lb.strategyMap[svcName].Name() != newStrategy {
+			lb.strategyMap[svcName].Release()           // release old
+			lb.setLoadBalancerStrategy(dr, newStrategy) // set new
+		}
+	}
+	lb.strategyMap[svcName].Update(oldDr, dr)
+}
+
+func (lb *LoadBalancerEX) OnDestinationRuleDelete(dr *istioapi.DestinationRule) {
+	lb.lock.Lock()
+	defer lb.lock.Unlock()
+
+	svcName := types.NamespacedName{Namespace: dr.Namespace, Name: dr.Name}
+	if _, exists := lb.strategyMap[svcName]; exists {
+		lb.strategyMap[svcName].Release()
+		delete(lb.strategyMap, svcName)
+	}
+}
+
+func (lb *LoadBalancerEX) OnDestinationRuleSynced() {
+}
+
+// setLoadBalancerStrategy new load-balance strategy by strategy name,
+// this assumes that lb.lock is already held.
+func (lb *LoadBalancerEX) setLoadBalancerStrategy(dr *istioapi.DestinationRule, strategyName string) {
+	svcName := types.NamespacedName{Namespace: dr.Namespace, Name: dr.Name}
+	switch strategyName {
+	case RoundRobin:
+		lb.strategyMap[svcName] = NewRoundRobinStrategy()
+	case Random:
+		lb.strategyMap[svcName] = NewRandomStrategy()
+	case ConsistentHash:
+		lb.strategyMap[svcName] = NewConsistentHashStrategy(dr, lb.getServiceEndpoints(svcName))
+	default:
+		klog.Errorf("unsupported or empty load-balance strategy %s", strategyName)
+		return
+	}
+}
+
+// getServiceEndpoints get a service backend endpoints,
+// this assumes that each portname of the service has the same endpoints.
+func (lb *LoadBalancerEX) getServiceEndpoints(svcName types.NamespacedName) []string {
+	for svcPort, state := range lb.services {
+		if svcPort.NamespacedName == svcName {
+			return state.endpoints
+		}
+	}
+	return []string{}
 }

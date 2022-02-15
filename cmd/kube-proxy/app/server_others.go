@@ -129,7 +129,7 @@ func newProxyServer(
 		return nil, err
 	}
 
-	client, eventClient, err := createClients(config.ClientConnection, master)
+	client, eventClient, istioClient, err := createClients(config.ClientConnection, master)
 	if err != nil {
 		return nil, err
 	}
@@ -345,7 +345,7 @@ func newProxyServer(
 
 		// TODO this has side effects that should only happen when Run() is invoked.
 		proxier, err = userspace.NewProxier(
-			userspace.NewLoadBalancerRR(),
+			userspace.NewLoadBalancerEX(),
 			netutils.ParseIPSloppy(config.BindAddress),
 			iptInterface,
 			execer,
@@ -369,6 +369,7 @@ func newProxyServer(
 	return &ProxyServer{
 		Client:                 client,
 		EventClient:            eventClient,
+		IstioClient:            istioClient,
 		IptInterface:           iptInterface,
 		IpvsInterface:          ipvsInterface,
 		IpsetInterface:         ipsetInterface,

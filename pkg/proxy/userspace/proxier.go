@@ -26,6 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	istioapi "istio.io/client-go/pkg/apis/networking/v1alpha3"
+
 	libcontaineruserns "github.com/opencontainers/runc/libcontainer/userns"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -705,6 +707,32 @@ func (proxier *Proxier) OnEndpointsSynced() {
 	// service event handler on startup with large numbers
 	// of initial objects
 	go proxier.syncProxyRules()
+}
+
+// OnDestinationRuleAdd is called whenever creation of new destination rule
+// object is observed.
+func (proxier *Proxier) OnDestinationRuleAdd(dr *istioapi.DestinationRule) {
+	proxier.loadBalancer.OnDestinationRuleAdd(dr)
+}
+
+// OnDestinationRuleUpdate is called whenever modification of an existing
+// destination rule object is observed.
+func (proxier *Proxier) OnDestinationRuleUpdate(oldDr, dr *istioapi.DestinationRule) {
+	proxier.loadBalancer.OnDestinationRuleUpdate(oldDr, dr)
+}
+
+// OnDestinationRuleDelete is called whenever deletion of an existing
+// destination rule object is observed.
+func (proxier *Proxier) OnDestinationRuleDelete(dr *istioapi.DestinationRule) {
+	proxier.loadBalancer.OnDestinationRuleDelete(dr)
+}
+
+// OnDestinationRuleSynced is called once all the initial event handlers were
+// called and the state is fully propagated to local cache.
+func (proxier *Proxier) OnDestinationRuleSynced() {
+	klog.V(2).InfoS("Userspace OnDestinationRuleSynced")
+	proxier.loadBalancer.OnDestinationRuleSynced()
+	// TODO Mark destination rule as initialized
 }
 
 func sameConfig(info *ServiceInfo, service *v1.Service, port *v1.ServicePort) bool {

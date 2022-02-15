@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"time"
 
+	istioapi "istio.io/client-go/pkg/apis/networking/v1alpha3"
+	istioinformers "istio.io/client-go/pkg/informers/externalversions/networking/v1alpha3"
+
 	v1 "k8s.io/api/core/v1"
 	discovery "k8s.io/api/discovery/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -498,5 +501,115 @@ func (c *NodeConfig) handleDeleteNode(obj interface{}) {
 	for i := range c.eventHandlers {
 		klog.V(4).InfoS("Calling handler.OnNodeDelete")
 		c.eventHandlers[i].OnNodeDelete(node)
+	}
+}
+
+// DestinationRuleHandler is an abstract interface of objects which receive
+// notifications about node object changes.
+type DestinationRuleHandler interface {
+	// OnDestinationRuleAdd is called whenever creation of new destination rule
+	// object is observed.
+	OnDestinationRuleAdd(dr *istioapi.DestinationRule)
+	// OnDestinationRuleUpdate is called whenever modification of an existing
+	// destination rule object is observed.
+	OnDestinationRuleUpdate(oldDr, dr *istioapi.DestinationRule)
+	// OnDestinationDelete is called whenever deletion of an existing
+	// destination rule object is observed.
+	OnDestinationRuleDelete(dr *istioapi.DestinationRule)
+	// OnDestinationSynced is called once all the initial event handlers were
+	// called and the state is fully propagated to local cache.
+	OnDestinationRuleSynced()
+}
+
+// DestinationRuleConfig tracks a set of destination rule configurations.
+type DestinationRuleConfig struct {
+	listerSynced  cache.InformerSynced
+	eventHandlers []DestinationRuleHandler
+}
+
+// NewDestinationRuleConfig creates a new DestinationRuleConfig.
+func NewDestinationRuleConfig(
+	drInformer istioinformers.DestinationRuleInformer,
+	resyncPeriod time.Duration) *DestinationRuleConfig {
+	result := &DestinationRuleConfig{
+		listerSynced: drInformer.Informer().HasSynced,
+	}
+
+	drInformer.Informer().AddEventHandlerWithResyncPeriod(
+		cache.ResourceEventHandlerFuncs{
+			AddFunc:    result.handleAddDestinationRule,
+			UpdateFunc: result.handleUpdateDestinationRule,
+			DeleteFunc: result.handleDeleteDestinationRule,
+		},
+		resyncPeriod,
+	)
+
+	return result
+}
+
+// RegisterEventHandler registers a handler which is called on every destination rule change.
+func (c *DestinationRuleConfig) RegisterEventHandler(handler DestinationRuleHandler) {
+	c.eventHandlers = append(c.eventHandlers, handler)
+}
+
+// Run starts the goroutine responsible for calling registered handlers.
+func (c *DestinationRuleConfig) Run(stopCh <-chan struct{}) {
+	klog.InfoS("Starting destination rule config controller")
+
+	if !cache.WaitForNamedCacheSync("destination rule config", stopCh, c.listerSynced) {
+		return
+	}
+
+	for i := range c.eventHandlers {
+		klog.V(3).InfoS("Calling handler.OnDestinationRuleSynced()")
+		c.eventHandlers[i].OnDestinationRuleSynced()
+	}
+}
+
+func (c *DestinationRuleConfig) handleAddDestinationRule(obj interface{}) {
+	dr, ok := obj.(*istioapi.DestinationRule)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).InfoS("Calling handler.OnDestinationRuleAdd")
+		c.eventHandlers[i].OnDestinationRuleAdd(dr)
+	}
+}
+
+func (c *DestinationRuleConfig) handleUpdateDestinationRule(oldObj, newObj interface{}) {
+	oldDr, ok := oldObj.(*istioapi.DestinationRule)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", oldObj))
+		return
+	}
+	dr, ok := newObj.(*istioapi.DestinationRule)
+	if !ok {
+		utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", newObj))
+		return
+	}
+	for i := range c.eventHandlers {
+		klog.V(5).InfoS("Calling handler.OnDestinationRuleUpdate")
+		c.eventHandlers[i].OnDestinationRuleUpdate(oldDr, dr)
+	}
+}
+
+func (c *DestinationRuleConfig) handleDeleteDestinationRule(obj interface{}) {
+	dr, ok := obj.(*istioapi.DestinationRule)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
+		}
+		if dr, ok = tombstone.Obj.(*istioapi.DestinationRule); !ok {
+			utilruntime.HandleError(fmt.Errorf("unexpected object type: %v", obj))
+			return
+		}
+	}
+	for i := range c.eventHandlers {
+		klog.V(4).InfoS("Calling handler.OnDestinationRuleDelete")
+		c.eventHandlers[i].OnDestinationRuleDelete(dr)
 	}
 }

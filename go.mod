@@ -23,6 +23,8 @@ require (
 	github.com/aws/aws-sdk-go v1.38.49
 	github.com/blang/semver v3.5.1+incompatible
 	github.com/boltdb/bolt v1.3.1 // indirect
+	github.com/buraksezer/consistent v0.9.0
+	github.com/cespare/xxhash/v2 v2.1.1
 	github.com/clusterhq/flocker-go v0.0.0-20160920122132-2b8b7259d313
 	github.com/container-storage-interface/spec v1.5.0
 	github.com/containernetworking/cni v0.8.1
@@ -99,17 +101,19 @@ require (
 	gonum.org/v1/netlib v0.0.0-20190331212654-76723241ea4e // indirect
 	google.golang.org/api v0.46.0
 	google.golang.org/genproto v0.0.0-20210831024726-fe130286e0e2
-	google.golang.org/grpc v1.40.0
+	google.golang.org/grpc v1.42.0
 	google.golang.org/protobuf v1.27.1
 	gopkg.in/gcfg.v1 v1.2.0
 	gopkg.in/square/go-jose.v2 v2.2.2
 	gopkg.in/yaml.v2 v2.4.0
-	k8s.io/api v0.0.0
+	istio.io/api v0.0.0-20220124163811-3adce9124ae7
+	istio.io/client-go v1.12.3
+	k8s.io/api v0.23.0
 	k8s.io/apiextensions-apiserver v0.0.0
-	k8s.io/apimachinery v0.0.0
+	k8s.io/apimachinery v0.23.1
 	k8s.io/apiserver v0.0.0
 	k8s.io/cli-runtime v0.0.0
-	k8s.io/client-go v0.0.0
+	k8s.io/client-go v0.23.1
 	k8s.io/cloud-provider v0.0.0
 	k8s.io/cluster-bootstrap v0.0.0
 	k8s.io/code-generator v0.0.0

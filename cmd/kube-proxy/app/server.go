@@ -34,6 +34,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	istioclientset "istio.io/client-go/pkg/clientset/versioned"
+	istioinformers "istio.io/client-go/pkg/informers/externalversions"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -530,6 +532,7 @@ with the apiserver API to configure the proxy.`,
 type ProxyServer struct {
 	Client                 clientset.Interface
 	EventClient            v1core.EventsGetter
+	IstioClient            istioclientset.Interface
 	IptInterface           utiliptables.Interface
 	IpvsInterface          utilipvs.Interface
 	IpsetInterface         utilipset.Interface
@@ -552,7 +555,7 @@ type ProxyServer struct {
 
 // createClients creates a kube client and an event client from the given config and masterOverride.
 // TODO remove masterOverride when CLI flags are removed.
-func createClients(config componentbaseconfig.ClientConnectionConfiguration, masterOverride string) (clientset.Interface, v1core.EventsGetter, error) {
+func createClients(config componentbaseconfig.ClientConnectionConfiguration, masterOverride string) (clientset.Interface, v1core.EventsGetter, istioclientset.Interface, error) {
 	var kubeConfig *rest.Config
 	var err error
 
@@ -567,7 +570,7 @@ func createClients(config componentbaseconfig.ClientConnectionConfiguration, mas
 			&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{Server: masterOverride}}).ClientConfig()
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	kubeConfig.AcceptContentTypes = config.AcceptContentTypes
@@ -577,15 +580,20 @@ func createClients(config componentbaseconfig.ClientConnectionConfiguration, mas
 
 	client, err := clientset.NewForConfig(kubeConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	eventClient, err := clientset.NewForConfig(kubeConfig)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return client, eventClient.CoreV1(), nil
+	istioClient, err := istioclientset.NewForConfig(kubeConfig)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	return client, eventClient.CoreV1(), istioClient, nil
 }
 
 func serveHealthz(hz healthcheck.ProxierHealthUpdater, errCh chan error) {
@@ -741,6 +749,7 @@ func (s *ProxyServer) Run() error {
 		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
 			options.LabelSelector = labelSelector.String()
 		}))
+	istioInformerFactory := istioinformers.NewSharedInformerFactory(s.IstioClient, s.ConfigSyncPeriod)
 
 	// Create configs (i.e. Watches for Services and Endpoints or EndpointSlices)
 	// Note: RegisterHandler() calls need to happen before creation of Sources because sources
@@ -760,9 +769,17 @@ func (s *ProxyServer) Run() error {
 		go endpointSliceConfig.Run(wait.NeverStop)
 	}
 
+	if destinationRuleHandler, ok := s.Proxier.(config.DestinationRuleHandler); ok {
+		destinationRuleConfig := config.NewDestinationRuleConfig(
+			istioInformerFactory.Networking().V1alpha3().DestinationRules(), s.ConfigSyncPeriod)
+		destinationRuleConfig.RegisterEventHandler(destinationRuleHandler)
+		go destinationRuleConfig.Run(wait.NeverStop)
+	}
+
 	// This has to start after the calls to NewServiceConfig and NewEndpointsConfig because those
 	// functions must configure their shared informer event handlers first.
 	informerFactory.Start(wait.NeverStop)
+	istioInformerFactory.Start(wait.NeverStop)
 
 	if utilfeature.DefaultFeatureGate.Enabled(features.TopologyAwareHints) {
 		// Make an informer that selects for our nodename.

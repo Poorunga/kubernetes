@@ -17,9 +17,11 @@ limitations under the License.
 package userspace
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,14 +92,18 @@ func (tcp *tcpProxySocket) ListenPort() int {
 
 // TryConnectEndpoints attempts to connect to the next available endpoint for the given service, cycling
 // through until it is able to successfully connect, or it has tried with all timeouts in EndpointDialTimeouts.
-func TryConnectEndpoints(service proxy.ServicePortName, srcAddr net.Addr, protocol string, loadBalancer LoadBalancer) (out net.Conn, err error) {
+func TryConnectEndpoints(service proxy.ServicePortName, srcAddr net.Addr, tcpConn *net.TCPConn, protocol string, loadBalancer LoadBalancer) (out net.Conn, err error) {
 	sessionAffinityReset := false
 	for _, dialTimeout := range EndpointDialTimeouts {
-		endpoint, err := loadBalancer.NextEndpoint(service, srcAddr, sessionAffinityReset)
+		endpoint, req, err := loadBalancer.NextEndpoint(service, srcAddr, tcpConn, sessionAffinityReset)
 		if err != nil {
 			klog.ErrorS(err, "Couldn't find an endpoint for service", "service", service)
 			return nil, err
 		}
+		// --- wangjiezhang
+		endpointInfo := strings.Split(endpoint, ":")
+		endpoint = fmt.Sprintf("%s:%s", endpointInfo[2], endpointInfo[3])
+		// --- wangjiezhang
 		klog.V(3).InfoS("Mapped service to endpoint", "service", service, "endpoint", endpoint)
 		// TODO: This could spin up a new goroutine to make the outbound connection,
 		// and keep accepting inbound traffic.
@@ -110,9 +116,28 @@ func TryConnectEndpoints(service proxy.ServicePortName, srcAddr net.Addr, protoc
 			sessionAffinityReset = true
 			continue
 		}
+		if req != nil {
+			reqBytes, err := httpRequestToBytes(req)
+			if err == nil {
+				outConn.Write(reqBytes)
+			}
+		}
 		return outConn, nil
 	}
 	return nil, fmt.Errorf("failed to connect to an endpoint")
+}
+
+// httpRequestToBytes transforms http.Request to bytes
+func httpRequestToBytes(req *http.Request) ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if req == nil {
+		return nil, fmt.Errorf("http request nil")
+	}
+	err := req.Write(buf)
+	if err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *ServiceInfo, loadBalancer LoadBalancer) {
@@ -139,7 +164,7 @@ func (tcp *tcpProxySocket) ProxyLoop(service proxy.ServicePortName, myInfo *Serv
 			continue
 		}
 		klog.V(3).InfoS("Accepted TCP connection from remote", "remoteAddress", inConn.RemoteAddr(), "localAddress", inConn.LocalAddr())
-		outConn, err := TryConnectEndpoints(service, inConn.(*net.TCPConn).RemoteAddr(), "tcp", loadBalancer)
+		outConn, err := TryConnectEndpoints(service, inConn.(*net.TCPConn).RemoteAddr(), inConn.(*net.TCPConn), "tcp", loadBalancer)
 		if err != nil {
 			klog.ErrorS(err, "Failed to connect to balancer")
 			inConn.Close()
@@ -255,7 +280,7 @@ func (udp *udpProxySocket) getBackendConn(activeClients *ClientCache, cliAddr ne
 		// and keep accepting inbound traffic.
 		klog.V(3).InfoS("New UDP connection from client", "address", cliAddr)
 		var err error
-		svrConn, err = TryConnectEndpoints(service, cliAddr, "udp", loadBalancer)
+		svrConn, err = TryConnectEndpoints(service, cliAddr, nil, "udp", loadBalancer)
 		if err != nil {
 			return nil, err
 		}
